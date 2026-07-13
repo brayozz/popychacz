@@ -1,18 +1,144 @@
 # patchbot-bridge
 
-Mały mostek: nasłuchuje na jednym kanale Discorda (tym, na który PatchBot
-wysyła powiadomienia) i każdą wiadomość przekazuje na Slacka przez
-Incoming Webhook.
+A small bridge: it listens on a single Discord channel (the one PatchBot
+posts update notifications to) and forwards every message to Slack via an
+Incoming Webhook — including formatting (headers, bold text, clickable
+links), not just raw text.
 
-Zaprojektowany pod: Debian 12, kontener LXC, 1 GB RAM. Zużycie w spoczynku
-to zwykle 50–80 MB RAM, więc limit `MemoryMax=200M` w usłudze systemd jest
-wygodnym marginesem bezpieczeństwa.
+Runs as a single Python process (`discord.py` + `requests`), no database.
+Idle memory usage is typically 50–80 MB, so it fits even on very small VPS
+instances.
 
 ---
 
-## 1. Kontener LXC
+## Table of contents
 
-Jeśli jeszcze go nie masz, na hoście:
+1. [How it works](#1-how-it-works)
+2. [Discord — creating the bot](#2-discord--creating-the-bot-step-by-step)
+3. [Slack — Incoming Webhook](#3-slack--incoming-webhook-step-by-step)
+4. [Option A: Debian 12 + LXC + systemd](#4-option-a-debian-12--lxc--systemd)
+5. [Option B: Alpine Linux, small VPS (256 MB RAM / 1 GB disk)](#5-option-b-alpine-linux-small-vps-256-mb-ram--1-gb-disk)
+6. [Testing](#6-testing)
+7. [Management and updates](#7-management-and-updates)
+8. [Troubleshooting](#8-troubleshooting)
+9. [Limitations](#9-limitations)
+
+---
+
+## 1. How it works
+
+- The bot connects to Discord over a WebSocket (gateway) and continuously
+  listens for the `on_message` event.
+- It filters messages down to a single, configured channel (ID in `.env`).
+- If a message has an embed (this is how PatchBot sends notifications: game
+  title, changelog, link, color, sometimes an image), the bridge converts it
+  into a Slack `attachment` (colored side bar, linked title, body text,
+  fields, footer).
+- **It converts Discord's markdown syntax into Slack's syntax (mrkdwn)** —
+  without this, something like `### Changes` would show up literally instead
+  of as a bold header, and links like `[[134325]](url)` would appear as
+  unclickable raw text. The bridge converts:
+  - headers (`# / ## / ###`) → bold text,
+  - bold `**text**` → `*text*` (Slack's syntax),
+  - underline `__text__` → plain text (Slack has no underline),
+  - links `[text](url)` → `<url|text>` (a clickable link in Slack).
+- It POSTs the payload to the Slack Incoming Webhook, with 3 retries and
+  backoff in case of a transient network error.
+
+Configuration is via environment variables in the `.env` file:
+
+| Variable | Description |
+|---|---|
+| `DISCORD_TOKEN` | Discord bot token |
+| `DISCORD_CHANNEL_ID` | ID of the channel to forward messages from |
+| `SLACK_WEBHOOK_URL` | Slack Incoming Webhook URL |
+| `BRIDGE_LOG_PATH` | (optional) path to the log file |
+
+---
+
+## 2. Discord — creating the bot (step by step)
+
+### 2.1 Create the application
+
+1. Go to **https://discord.com/developers/applications** and log in.
+2. In the top-right corner, click the blue **New Application** button.
+3. Enter a name, e.g. `PatchBot Bridge`, accept the terms, click **Create**.
+4. You'll land on the **General Information** page — the left-hand menu
+   (General Information, OAuth2, Bot, etc.) is what we'll use next.
+
+### 2.2 Turn the application into a bot and get the token
+
+1. Click **Bot** in the left menu.
+2. The bot already exists (Discord creates it automatically with the
+   application) — you'll see its name and icon.
+3. In the **Token** section, click **Reset Token** (confirm with
+   password/2FA if Discord asks) — the token is shown only once, so click
+   **Copy** immediately.
+4. Paste this token into `.env` as `DISCORD_TOKEN`. **Never share it or
+   commit it to Git** — whoever has the token fully controls the bot.
+5. Scroll down to **Privileged Gateway Intents** and enable **only**
+   **MESSAGE CONTENT INTENT** (without it, the bot can't read message
+   content/embeds). Leave the other two toggles off.
+6. Click **Save Changes** at the bottom of the page.
+
+### 2.3 Build the invite link
+
+1. Click **OAuth2** in the left menu, then find the **URL Generator** section.
+2. Under **Scopes**, check only `bot`.
+3. Under **Bot Permissions**, check only: **View Channel**, **Read Message History**.
+4. Copy the generated URL at the bottom of the page and open it in a new tab.
+5. Pick your server from the **Add to Server** dropdown → **Continue** →
+   **Authorize**.
+6. The bot will appear in your server's member list (offline until you run
+   the script).
+
+### 2.4 Find the ID of the channel PatchBot posts to
+
+1. In Discord: **User Settings** → **Advanced** → enable **Developer Mode**.
+2. Right-click the channel PatchBot posts to → **Copy Channel ID**.
+3. Paste the value into `.env` as `DISCORD_CHANNEL_ID`.
+
+---
+
+## 3. Slack — Incoming Webhook (step by step)
+
+### 3.1 Create the Slack app
+
+1. Go to **https://api.slack.com/apps**, log in with an account that has
+   access to the `bartlabsdev` workspace.
+2. Click **Create New App** → **From scratch**.
+3. Name it e.g. `PatchBot Bridge`, workspace: **bartlabsdev**, click
+   **Create App**.
+
+### 3.2 Enable Incoming Webhooks
+
+1. Click **Incoming Webhooks** in the left menu.
+2. Toggle **Activate Incoming Webhooks** on.
+3. Click **Add New Webhook to Workspace**.
+4. Pick the target channel from the **Post to** dropdown (e.g. a dedicated
+   `#patchbot-notifications`), click **Allow**.
+5. You'll return to the page with a new row under **Webhook URLs for Your
+   Workspace** — copy the URL (`https://hooks.slack.com/services/...`).
+6. Paste it into `.env` as `SLACK_WEBHOOK_URL`.
+
+### 3.3 Quick test before running the bridge
+
+```bash
+curl -X POST -H 'Content-type: application/json' \
+  --data '{"text":"Test from terminal - if you see this, the webhook works"}' \
+  "PASTE_YOUR_WEBHOOK_URL_HERE"
+```
+
+Treat this URL like a password — anyone who has it can post to your channel.
+
+---
+
+## 4. Option A: Debian 12 + LXC + systemd
+
+Use this option if you have a "normal" VPS running Debian (e.g. 1 GB RAM,
+10 GB disk) with an LXC container.
+
+### 4.1 LXC container (on the host)
 
 ```bash
 lxc-create -n patchbridge -t debian -- -r bookworm
@@ -20,154 +146,17 @@ lxc-start -n patchbridge
 lxc-attach -n patchbridge
 ```
 
-W kontenerze:
+### 4.2 System packages (inside the container)
 
 ```bash
 apt update && apt install -y python3 python3-venv python3-pip
 ```
 
-## 2. Discord — utworzenie bota (krok po kroku)
-
-### 2.1 Załóż aplikację
-
-1. Wejdź na **https://discord.com/developers/applications** i zaloguj się
-   (tym samym kontem, którym korzystasz z Discorda normalnie).
-2. W prawym górnym rogu kliknij niebieski przycisk **New Application**.
-3. Pojawi się okienko z polem na nazwę — wpisz np. `PatchBot Bridge`
-   (to tylko nazwa techniczna, użytkownicy jej raczej nie zobaczą inaczej
-   niż jako nazwę bota na serwerze), zaakceptuj regulamin i kliknij **Create**.
-4. Zostaniesz przeniesiony na stronę **General Information** tej aplikacji.
-   To jest "centrum dowodzenia" — po lewej stronie masz pionowe menu
-   (General Information, OAuth2, Bot, itd.). Tego menu będziemy używać
-   w kolejnych krokach.
-
-### 2.2 Zamień aplikację w bota i zdobądź token
-
-1. W lewym menu kliknij **Bot**.
-2. Na tej stronie od razu widzisz, że bot już istnieje (Discord tworzy go
-   automatycznie razem z aplikacją) — zobaczysz jego nazwę i ikonę.
-3. Znajdź sekcję z napisem **Token**. Jeśli token nie jest jeszcze widoczny,
-   kliknij **Reset Token** (potwierdź, jeśli Discord poprosi o hasło/2FA) —
-   token pokaże się tylko raz, więc od razu kliknij **Copy**.
-4. Wklej ten token do pliku `.env` jako wartość `DISCORD_TOKEN`
-   (patrz sekcja 4 niżej). **Nikomu go nie pokazuj i nie wrzucaj do Gita** —
-   kto ma token, ten w pełni kontroluje bota.
-5. Na tej samej stronie **Bot**, przewiń niżej do sekcji
-   **Privileged Gateway Intents**. Zobaczysz tam trzy przełączniki:
-   `PRESENCE INTENT`, `SERVER MEMBERS INTENT`, `MESSAGE CONTENT INTENT`.
-   Włącz (kliknij, żeby zrobił się zielony/aktywny) **wyłącznie**
-   **MESSAGE CONTENT INTENT** — pozostałych dwóch nie potrzebujemy.
-   Bez tego przełącznika bot owszem "zobaczy", że przyszła wiadomość,
-   ale pole z jej treścią i embedami będzie puste.
-6. Na dole strony kliknij **Save Changes** (Discord czasem pokazuje ten
-   przycisk dopiero po najechaniu na dół strony — jeśli nie widzisz zmiany,
-   odśwież stronę i sprawdź, czy przełącznik faktycznie został zapisany).
-
-### 2.3 Zbuduj link zapraszający bota na serwer
-
-1. W lewym menu kliknij **OAuth2**, a potem w tej samej sekcji znajdź
-   podstronę **URL Generator** (na niektórych układach to zakładka/sekcja
-   na tej samej stronie OAuth2, przewiń jeśli nie widzisz od razu).
-2. W sekcji **Scopes** zaznacz checkbox **bot** (nic więcej, nie zaznaczaj
-   `applications.commands` — nie potrzebujemy komend slash).
-3. Po zaznaczeniu `bot` pod spodem pojawi się nowa sekcja
-   **Bot Permissions**. Zaznacz tam tylko:
-   - **View Channel**
-   - **Read Message History**
-   
-   Nie zaznaczaj niczego więcej (bot nie musi pisać ani zarządzać serwerem).
-4. Na samym dole strony pojawi się wygenerowany **URL** — kliknij **Copy**.
-5. Wklej ten URL w nowej karcie przeglądarki i wciśnij Enter.
-6. Discord pokaże ekran wyboru serwera — z rozwijanej listy **Add to Server**
-   wybierz swój serwer (ten, na którym jest kanał z PatchBotem) i kliknij
-   **Continue**, a potem **Authorize**.
-7. Jeśli wszystko poszło dobrze, zobaczysz krótki komunikat/animację
-   potwierdzającą i bot pojawi się na liście członków Twojego serwera
-   (zwykle w osobnej sekcji "Boty" po prawej stronie, offline dopóki
-   nie uruchomisz skryptu).
-
-### 2.4 Znajdź ID kanału, na który wysyła PatchBot
-
-1. W aplikacji Discord (desktop albo web) wejdź w **Ustawienia użytkownika**
-   (ikonka zębatki przy Twoim nicku na dole po lewej).
-2. Po lewej stronie ustawień znajdź sekcję **Zaawansowane** (Advanced)
-   i włącz przełącznik **Tryb dewelopera** (Developer Mode).
-3. Zamknij ustawienia (Escape), wróć do serwera i znajdź na liście kanałów
-   ten, na który PatchBot wysyła powiadomienia.
-4. Kliknij na niego prawym przyciskiem myszy (na telefonie: przytrzymaj) —
-   na samym dole menu kontekstowego pojawi się nowa opcja
-   **Kopiuj ID kanału** (Copy Channel ID). Kliknij ją.
-5. Wklej skopiowaną wartość (sam ciąg cyfr, np. `1234567890123456789`)
-   do `.env` jako `DISCORD_CHANNEL_ID`.
-
-Uwaga: bot nie musi nic pisać ani mieć uprawnień do wysyłania wiadomości —
-tylko czyta ten jeden kanał. Nie musi też widzieć innych kanałów serwera,
-jeśli chcesz mu ograniczyć dostęp tylko do tego jednego — w ustawieniach
-kanału (Edytuj kanał -> Uprawnienia) możesz ręcznie dodać rolę bota
-z dostępem tylko do tego kanału, jeśli reszta serwera ma być dla niego
-niewidoczna.
-
-## 3. Slack — Incoming Webhook (krok po kroku)
-
-### 3.1 Załóż aplikację Slacka
-
-1. Wejdź na **https://api.slack.com/apps** i zaloguj się kontem, które ma
-   dostęp do workspace `bartlabsdev`.
-2. Kliknij zielony przycisk **Create New App** (prawy górny róg).
-3. Pojawi się okienko z wyborem: **From scratch** vs **From an app manifest**.
-   Wybierz **From scratch** (prościej dla jednego webhooka).
-4. W polu **App Name** wpisz np. `PatchBot Bridge`.
-5. W polu **Pick a workspace to develop your app in** z listy rozwijanej
-   wybierz **bartlabsdev**.
-6. Kliknij **Create App**. Zostaniesz przeniesiony na stronę
-   **Basic Information** tej aplikacji — to jest jej strona główna,
-   z lewym menu nawigacyjnym (podobnie jak w Discordzie).
-
-### 3.2 Włącz Incoming Webhooks
-
-1. W lewym menu znajdź i kliknij **Incoming Webhooks** (może być w sekcji
-   nazwanej **Features**, w zależności od układu menu).
-2. Zobaczysz przełącznik **Activate Incoming Webhooks** — kliknij go,
-   żeby ustawić na **On**. Strona się odświeży i pokaże dodatkowe opcje.
-3. Przewiń niżej do sekcji **Webhook URLs for Your Workspace** — na razie
-   będzie pusta, kliknij przycisk **Add New Webhook to Workspace**
-   (czasem podpisany po prostu jako duży przycisk na dole tej sekcji).
-4. Slack przeniesie Cię na ekran autoryzacji (podobny do logowania OAuth) —
-   z rozwijanej listy **Post to** wybierz kanał, na który mają trafiać
-   powiadomienia od PatchBota (możesz wcześniej utworzyć dedykowany kanał,
-   np. `#patchbot-notifications`, żeby nie mieszać z innymi wiadomościami).
-5. Kliknij zielony przycisk **Allow** (lub **Authorize**).
-6. Wrócisz na stronę **Incoming Webhooks** Twojej aplikacji — w sekcji
-   **Webhook URLs for Your Workspace** zobaczysz teraz nowy wiersz z:
-   - nazwą kanału, do którego webhook jest przypisany,
-   - długim URL-em w formacie
-     `https://hooks.slack.com/services/T000000/B000000/xxxxxxxxxxxxxxxxxxxxxxxx`
-7. Kliknij przycisk **Copy** obok tego URL-a.
-8. Wklej go do `.env` jako `SLACK_WEBHOOK_URL`.
-
-### 3.3 Szybki test (opcjonalnie, zanim uruchomisz cały mostek)
-
-Możesz od razu sprawdzić, czy webhook działa, jednym poleceniem z dowolnego
-terminala (np. z Twojego komputera, nie musi to być VPS):
-
-```bash
-curl -X POST -H 'Content-type: application/json' \
-  --data '{"text":"Test z terminala - jesli to widzisz, webhook dziala"}' \
-  "TU_WKLEJ_SWOJ_WEBHOOK_URL"
-```
-
-Jeśli w skonfigurowanym kanale na Slacku pojawi się ta wiadomość — webhook
-jest gotowy i możesz przejść do uruchomienia mostka.
-
-Uwaga: URL webhooka jest **sekretem** — każdy, kto go zna, może wysyłać
-wiadomości na Twój kanał bez żadnego dodatkowego uwierzytelnienia. Traktuj
-go jak hasło.
-
-## 4. Instalacja aplikacji w kontenerze
+### 4.3 Install the application
 
 ```bash
 mkdir -p /opt/patchbot-bridge
-# skopiuj tam bridge.py, requirements.txt, .env.example, patchbot-bridge.service
+# copy bridge.py, requirements.txt, .env.example, patchbot-bridge.service there
 cd /opt/patchbot-bridge
 
 python3 -m venv venv
@@ -175,10 +164,10 @@ python3 -m venv venv
 ./venv/bin/pip install -r requirements.txt
 
 cp .env.example .env
-nano .env   # uzupełnij DISCORD_TOKEN, DISCORD_CHANNEL_ID, SLACK_WEBHOOK_URL
+nano .env   # fill in DISCORD_TOKEN, DISCORD_CHANNEL_ID, SLACK_WEBHOOK_URL
 ```
 
-Utwórz dedykowanego, niepriuvilegowanego użytkownika systemowego:
+### 4.4 System user
 
 ```bash
 useradd --system --no-create-home --shell /usr/sbin/nologin patchbridge
@@ -186,7 +175,7 @@ mkdir -p /var/log/patchbot-bridge
 chown -R patchbridge:patchbridge /opt/patchbot-bridge /var/log/patchbot-bridge
 ```
 
-## 5. Uruchomienie jako usługa systemd
+### 4.5 systemd service
 
 ```bash
 cp patchbot-bridge.service /etc/systemd/system/
@@ -196,43 +185,201 @@ systemctl status patchbot-bridge
 journalctl -u patchbot-bridge -f
 ```
 
-Po starcie w logu powinieneś zobaczyć coś w stylu:
+---
+
+## 5. Option B: Alpine Linux, small VPS (256 MB RAM / 1 GB disk)
+
+This is the option actually used in production for this project. Differences
+from Debian: the package manager is `apk` (not `apt`), the C library is musl
+(not glibc), and the init system is **OpenRC** (not systemd) — which is why
+a separate `patchbot-bridge.openrc` file is needed instead of `.service`.
+
+### 5.1 Swap (important at 256 MB RAM)
+
+Installing Python packages with any C compilation can briefly exceed
+256 MB RAM:
+
+```sh
+dd if=/dev/zero of=/swapfile bs=1M count=512
+chmod 600 /swapfile
+mkswap /swapfile
+swapon /swapfile
+echo "/swapfile none swap sw 0 0" >> /etc/fstab
+```
+
+### 5.2 System packages via apk
+
+```sh
+apk update
+apk add python3 py3-pip py3-virtualenv
+
+# prebuilt binary packages, to avoid pip having to compile anything
+# (saves both RAM and disk)
+apk add py3-aiohttp py3-yarl py3-multidict py3-frozenlist py3-attrs
+```
+
+### 5.3 Install the application
+
+```sh
+mkdir -p /opt/patchbot-bridge
+# copy bridge.py, requirements.txt, .env.example, patchbot-bridge.openrc there
+cd /opt/patchbot-bridge
+
+python3 -m venv --system-site-packages venv
+./venv/bin/pip install --no-cache-dir -r requirements.txt
+```
+
+If pip still starts compiling something from source (you'll see
+`Building wheel for ...` in the log), install build tools temporarily,
+then remove them afterwards:
+
+```sh
+apk add --virtual .build-deps build-base musl-dev libffi-dev
+./venv/bin/pip install --no-cache-dir -r requirements.txt
+apk del .build-deps
+```
+
+```sh
+cp .env.example .env
+vi .env   # fill in DISCORD_TOKEN, DISCORD_CHANNEL_ID, SLACK_WEBHOOK_URL
+```
+
+### 5.4 System user and logs
+
+```sh
+addgroup -S patchbridge
+adduser -S -G patchbridge -H -s /sbin/nologin patchbridge
+mkdir -p /var/log/patchbot-bridge
+chown -R patchbridge:patchbridge /opt/patchbot-bridge /var/log/patchbot-bridge
+```
+
+### 5.5 OpenRC service
+
+```sh
+cp patchbot-bridge.openrc /etc/init.d/patchbot-bridge
+chmod +x /etc/init.d/patchbot-bridge
+rc-update add patchbot-bridge default
+rc-service patchbot-bridge start
+rc-service patchbot-bridge status
+tail -f /var/log/patchbot-bridge/bridge.log
+```
+
+### 5.6 Cleaning up disk space
+
+```sh
+rm -rf /var/cache/apk/*
+```
+
+### 5.7 Realistic resource assessment
+
+- Idle bot: 50–80 MB RAM, minimal network traffic.
+- The riskiest moment is dependency installation itself — hence the swap
+  and `--system-site-packages` above.
+- If disk space runs out during install: `df -h` and
+  `du -sh /opt/patchbot-bridge/venv` to see what's taking up space.
+- 1 GB of disk leaves no margin for the future (logs, apk upgrades), but is
+  enough for the bridge itself.
+
+---
+
+## 6. Testing
+
+After starting the service (either option), the log should show:
 
 ```
-Zalogowano jako PatchBot Bridge#1234 (ID: ...)
-Nasłuchuję na kanale #patchbot-notifications (123456789012345678)
+Logged in as PatchBot Bridge#1234 (ID: ...)
+Listening on channel #patchbot-notifications (123456789012345678)
 ```
 
-Test: poczekaj na kolejne powiadomienie od PatchBota — albo (jeśli chcesz
-przetestować od razu) napisz dowolną wiadomość na tym kanale — powinna
-pojawić się na Slacku.
+Post any message in the watched Discord channel — it should show up on
+Slack (formatted: bold text, clickable links instead of raw markdown).
 
-## 6. Aktualizacje / zarządzanie
+---
+
+## 7. Management and updates
+
+**Alpine / OpenRC:**
+
+```sh
+rc-service patchbot-bridge restart   # after changing .env or the code
+rc-service patchbot-bridge stop
+tail -f /var/log/patchbot-bridge/bridge.log
+```
+
+**Debian / systemd:**
 
 ```bash
-systemctl restart patchbot-bridge   # po zmianie .env lub kodu
+systemctl restart patchbot-bridge
 systemctl stop patchbot-bridge
-journalctl -u patchbot-bridge -n 100 --no-pager   # ostatnie logi
+journalctl -u patchbot-bridge -n 100 --no-pager
 ```
 
-## Jak to działa (skrót)
+Swapping out just the code (`bridge.py`) without changing
+`requirements.txt` doesn't require reinstalling any packages — just
+replace the file and restart the service.
 
-- Bot łączy się do Discorda przez WebSocket (gateway) i cały czas nasłuchuje
-  zdarzenia `on_message`.
-- Filtruje wiadomości tylko z jednego, skonfigurowanego kanału.
-- Jeśli wiadomość ma embed (tak wysyła PatchBot: tytuł gry, opis zmian,
-  link, kolor), mostek konwertuje go na Slackowy `attachment` (kolorowy pasek,
-  tytuł z linkiem, treść, pola, stopka).
-- Wysyła payload POST-em na Slack Incoming Webhook, z 3 próbami i backoffem
-  w razie chwilowego błędu sieci.
+---
 
-## Ograniczenia / co warto wiedzieć
+## 8. Troubleshooting
 
-- Jeśli VPS/kontener zrestartuje się lub straci połączenie na dłużej,
-  wiadomości wysłane przez PatchBota w tym czasie **nie zostaną odtworzone
-  wstecznie** — to prosty mostek "live", a nie synchronizacja historii.
-  Jeśli chciałbyś dogrywanie zaległych wiadomości po restarcie, da się to
-  dodać (zapamiętywanie ostatniego przetworzonego ID wiadomości i doczytanie
-  historii kanału przy starcie) — daj znać, jeśli to ważne.
-- `discord.py` wymaga Pythona 3.9+; Debian 12 ma domyślnie Python 3.11, więc
-  jest ok.
+### Messages arrive duplicated
+
+The most common cause: **two `bridge.py` processes running at the same
+time** (e.g. an old one on a previous server, plus a new one). Check:
+
+```sh
+ps aux | grep bridge.py
+```
+
+If you see more than one process (besides the `grep` itself), stop the
+extra one:
+
+```sh
+pkill -f bridge.py
+rc-service patchbot-bridge start    # or: systemctl start patchbot-bridge
+```
+
+A second possible cause: a single process, but the request to Slack
+exceeded the 10-second timeout and the script retried, even though the
+first message actually went through. Check the log:
+
+```sh
+grep -E "network error|responded" /var/log/patchbot-bridge/bridge.log
+```
+
+The most reliable way to rule out a "forgotten" old bridge instance (e.g.
+on a previously used server) is to **rotate the bot token**: Discord
+Developer Portal → your application → **Bot** → **Reset Token**, then paste
+the new token only into the currently used `.env`. The old token stops
+working immediately, so any forgotten process will stop being able to
+connect.
+
+### Raw markdown instead of formatted text on Slack (`### Changes`, `[text](url)`)
+
+Make sure you're running the current version of `bridge.py`, which
+includes the `discord_markdown_to_slack()` conversion function — older
+versions forwarded the embed description without converting it. Replace
+the file and restart the service.
+
+### Bot doesn't see the channel / `on_ready` shows a warning
+
+Check that the bot has the **View Channel** permission on that specific
+channel (it may have server access but not channel access, if the channel
+has permission overrides).
+
+### 403/404 error when posting to Slack
+
+Usually means an outdated or incorrectly copied `SLACK_WEBHOOK_URL` —
+generate a new webhook following the steps in section 3.
+
+---
+
+## 9. Limitations
+
+- This is a "live" bridge — if the server loses connectivity for a while,
+  messages PatchBot sent during that time are not replayed afterwards (no
+  channel history backfill on restart).
+- Very long changelogs get truncated by Slack's UI itself ("Show more") —
+  this is a Slack limitation and can't be fully disabled.
+- `discord.py` requires Python 3.9+; both Debian 12 and current Alpine ship
+  with a new enough Python by default.
