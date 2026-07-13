@@ -1,0 +1,32 @@
+#!/sbin/openrc-run
+# Skrypt OpenRC dla patchbot-bridge (Alpine Linux)
+# Umieść w /etc/init.d/patchbot-bridge i nadaj prawa: chmod +x /etc/init.d/patchbot-bridge
+
+name="patchbot-bridge"
+description="PatchBot Discord -> Slack bridge"
+
+command="/opt/patchbot-bridge/venv/bin/python3"
+command_args="/opt/patchbot-bridge/bridge.py"
+command_user="patchbridge:patchbridge"
+
+directory="/opt/patchbot-bridge"
+
+# uruchamiamy w tle, OpenRC sam pilnuje procesu przez supervise-daemon
+supervisor="supervise-daemon"
+
+output_log="/var/log/patchbot-bridge/bridge.log"
+error_log="/var/log/patchbot-bridge/bridge.log"
+
+# .env wczytywany jest przez python-dotenv wewnątrz bridge.py,
+# więc nie musimy tu nic dodatkowo eksportować
+
+pidfile="/run/patchbot-bridge.pid"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    checkpath -d -m 0755 -o patchbridge:patchbridge /var/log/patchbot-bridge
+}
