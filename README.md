@@ -255,6 +255,11 @@ chown -R patchbridge:patchbridge /opt/patchbot-bridge /var/log/patchbot-bridge
 
 ### 5.5 OpenRC service
 
+The provided `patchbot-bridge.openrc` includes `respawn_max`,
+`respawn_period`, and `respawn_delay` settings so OpenRC automatically
+restarts the process if it crashes (e.g. after an unhandled disconnect),
+without needing manual intervention.
+
 ```sh
 cp patchbot-bridge.openrc /etc/init.d/patchbot-bridge
 chmod +x /etc/init.d/patchbot-bridge
@@ -371,6 +376,89 @@ has permission overrides).
 
 Usually means an outdated or incorrectly copied `SLACK_WEBHOOK_URL` —
 generate a new webhook following the steps in section 3.
+
+### Messages stopped arriving entirely, no crash logged after a certain point
+
+Check whether the process is actually still running:
+
+```sh
+ps aux | grep bridge.py
+```
+
+If nothing shows up (besides `grep` itself), the process died and wasn't
+restarted. Common causes on a 256 MB RAM VPS: the OOM killer terminated it.
+Check:
+
+```sh
+dmesg | grep -i -E "kill|oom" | tail -20
+```
+
+If you see `bridge.py` or `python3` mentioned there, RAM pressure was the
+cause. Make sure `patchbot-bridge.openrc` has `respawn_max` / `respawn_period`
+/ `respawn_delay` set (see section 5.5) so OpenRC restarts the process
+automatically next time, instead of leaving it dead.
+
+### Service stuck in `unsupervised` / "already starting"
+
+```
+rc-service patchbot-bridge start
+ * WARNING: patchbot-bridge is already starting
+rc-service patchbot-bridge status
+ * status: unsupervised
+```
+
+This means the service's internal state got stuck — usually after the
+process died in an unusual way and OpenRC didn't clean up its own
+bookkeeping. Fix:
+
+```sh
+rc-service patchbot-bridge zap
+rm -f /run/patchbot-bridge.pid
+rc-service patchbot-bridge start
+rc-service patchbot-bridge status
+```
+
+`status` should now say `started` rather than `unsupervised`.
+
+One-liner for the same fix, safe to paste as a single line if you're doing
+this from a phone SSH client:
+
+```sh
+rc-service patchbot-bridge zap; rm -f /run/patchbot-bridge.pid; rc-service patchbot-bridge start; rc-service patchbot-bridge status
+```
+
+### `/etc/init.d/patchbot-bridge` is read-only when trying to edit it
+
+Check these three things, in order:
+
+```sh
+whoami
+```
+
+If this isn't `root`, you likely don't have write access to files in
+`/etc/init.d/` — use `sudo vi ...` or `su -` first.
+
+```sh
+ls -l /etc/init.d/patchbot-bridge
+```
+
+If the permission bits show no `w` at all (e.g. `-r--r--r--`), fix them:
+
+```sh
+chmod 755 /etc/init.d/patchbot-bridge
+```
+
+```sh
+mount | grep " / "
+```
+
+If this shows `ro` instead of `rw`, the whole filesystem is mounted
+read-only (can happen after an unclean restart/OOM on small VPS instances)
+— remount it:
+
+```sh
+mount -o remount,rw /
+```
 
 ---
 
