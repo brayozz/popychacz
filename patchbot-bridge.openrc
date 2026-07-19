@@ -14,6 +14,14 @@ directory="/opt/patchbot-bridge"
 # uruchamiamy w tle, OpenRC sam pilnuje procesu przez supervise-daemon
 supervisor="supervise-daemon"
 
+# automatyczny restart po awarii procesu (np. po zerwaniu połączenia
+# z Discordem, które nie zostało obsłużone wewnątrz aplikacji):
+# do 10 prób restartu w ciągu 5 minut (300 s); jeśli w tym oknie padnie
+# więcej niż 10 razy, OpenRC się podda, żeby nie robić pętli restartów
+respawn_max=10
+respawn_period=300
+respawn_delay=5
+
 output_log="/var/log/patchbot-bridge/bridge.log"
 error_log="/var/log/patchbot-bridge/bridge.log"
 
